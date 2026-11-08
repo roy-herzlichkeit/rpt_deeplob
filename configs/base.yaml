@@ -1,0 +1,4 @@
+global_batch: 64
+epochs: 5
+seed: 42
+lr: TODO

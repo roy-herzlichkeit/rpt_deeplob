@@ -1,0 +1,13 @@
+data/
+*.pt
+.venv/
+__pycache__/
+CLAUDE.local.md
+CLAUDE.md
+.claude/
+prompts/
+briefs/
+*.zip
+*.pth
+*.ckpt
+.env
