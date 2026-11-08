@@ -1,0 +1,4 @@
+# Run queue for scripts/run_queue.py: one run per line, "<run_id>: <train.py arguments>".
+# Do not add --run-id or --resume (run_queue.py adds them). Start run_queue.py on both nodes.
+# Example:
+#   g64_balanced_43_21: --mode balanced --local-batches 43,21 --epochs 5

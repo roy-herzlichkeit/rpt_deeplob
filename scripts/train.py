@@ -46,6 +46,7 @@ TEST_FILES = ["Test_Dst_NoAuction_DecPre_CF_7",
               "Test_Dst_NoAuction_DecPre_CF_9"]
 VAL_FRAC = 0.2
 GAP = 100                    # unused time steps between the train and val parts
+PG_TIMEOUT_S = 120          # a rank that loses its peer must exit, not hang
 RESUME_MUST_MATCH = ["mode", "global_batch", "local_batches", "lr", "seed", "k_index", "head",
                      "max_steps"]
 
@@ -213,13 +214,17 @@ def parse_args():
     ap.add_argument("--max-steps", type=int, default=None,
                     help="cap on optimizer steps per epoch (smoke tests)")
     ap.add_argument("--run-id", default=None)
-    ap.add_argument("--resume", action="store_true", help="continue from checkpoints/<run_id>/last.pt")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue at the saved epoch and step from checkpoints/<run_id>/rank<r>/last.pt\n"
+                         "(last.pt.prev if last.pt is missing or unreadable)")
     ap.add_argument("--k-index", type=int, default=3, choices=range(5),
                     help="label row 0..4 = horizon k=10,20,30,50,100 (default 3 = k50)")
     ap.add_argument("--head", choices=["softmax", "logits"], default="logits",
                     help="logits = plain CE (default); softmax = notebook (CE on softmax output)")
     ap.add_argument("--cudnn-benchmark", choices=["on", "off"], default="on",
                     help="cuDNN autotuning (on: autotune happens in the untimed warm-up)")
+    ap.add_argument("--ckpt-every", type=int, default=1000,
+                    help="also save last.pt every N steps inside an epoch (0 = only at epoch end)")
     ap.add_argument("--eval-batch", type=int, default=1024)
     ap.add_argument("--log-every", type=int, default=500)
     args = ap.parse_args()
@@ -323,23 +328,75 @@ def set_rng_state(s):
     random.setstate(s["python"])
 
 
-def save_atomic(obj, path):
-    tmp = path.with_suffix(".tmp")
-    torch.save(obj, tmp)
+def fsync_dir(d):
+    fd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def save_durable(obj, path, keep_prev=False):
+    """Crash-safe save: write <name>.tmp, flush + fsync, (optionally move the current file to
+    <name>.prev), os.replace tmp -> path, then fsync the folder so the rename itself is on disk."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as f:
+        torch.save(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
+    if keep_prev and path.exists():
+        os.replace(path, path.with_name(path.name + ".prev"))
     os.replace(tmp, path)
+    fsync_dir(path.parent)
 
 
-def truncate_csv(path, max_epoch):
-    """On resume: drop rows of epochs that were not checkpointed."""
+CKPT_KEYS = ("model", "optimizer", "epoch", "step", "epoch_done", "rng", "args", "derived",
+             "best_val_loss", "best_epoch", "progress")
+
+
+def load_ckpt(path):
+    """Return the checkpoint dict, or None if the file is missing, truncated or incomplete."""
+    if not path.exists():
+        return None
+    try:
+        c = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:  # noqa: BLE001  (truncated / corrupt file)
+        return None
+    return c if isinstance(c, dict) and all(k in c for k in CKPT_KEYS) else None
+
+
+def ckpt_pos(c):
+    """Training position of a checkpoint: (epoch, steps done in that epoch, epoch finished)."""
+    return (int(c["epoch"]), int(c["step"]), bool(c["epoch_done"]))
+
+
+def state_digest(model, optimizer):
+    """sha256 of all parameters and optimizer tensors (BatchNorm buffers excluded: they differ
+    per rank by design)."""
+    h = hashlib.sha256()
+    for p in model.parameters():
+        h.update(p.detach().cpu().numpy().tobytes())
+    for st in optimizer.state_dict()["state"].values():
+        for key in sorted(st):
+            v = st[key]
+            h.update(v.detach().cpu().numpy().tobytes() if torch.is_tensor(v) else repr(v).encode())
+    return h.hexdigest()
+
+
+def filter_csv(path, keep):
+    """On resume: keep the header and the rows for which keep(row) is true (durable rewrite)."""
     if not path.exists():
         return
     with open(path, newline="") as f:
         rows = list(csv.reader(f))
     if not rows:
         return
-    kept = [rows[0]] + [r for r in rows[1:] if r and int(r[0]) <= max_epoch]
-    with open(path, "w", newline="") as f:
-        csv.writer(f).writerows(kept)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", newline="") as f:
+        csv.writer(f).writerows([rows[0]] + [r for r in rows[1:] if r and keep(r)])
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def append_csv(path, header, rows):
@@ -349,6 +406,8 @@ def append_csv(path, header, rows):
         if new:
             w.writerow(header)
         w.writerows(rows)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 @torch.no_grad()
@@ -395,8 +454,11 @@ def main():
     torch.backends.cudnn.allow_tf32 = False          # strict fp32 on both GPUs
     torch.backends.cuda.matmul.allow_tf32 = False
     if distributed:
+        # NCCL: on a timed-out or failed collective, tear the process down (do not hang)
+        os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "3")
         extra = {"device_id": dev} if args.backend == "nccl" else {}
-        dist.init_process_group(backend=args.backend, timeout=datetime.timedelta(minutes=30), **extra)
+        dist.init_process_group(backend=args.backend,
+                                timeout=datetime.timedelta(seconds=PG_TIMEOUT_S), **extra)
     is_main = rank == 0
 
     def log(msg):
@@ -405,20 +467,28 @@ def main():
 
     # ---- startup checks, shared by all ranks so that no rank exits alone and leaves the other
     # one waiting in a collective. Every rank must run with the same settings and code.
+    # Each rank checks its OWN disk (every node keeps its own logs/ and checkpoints/).
     run_id = args.run_id or f"{args.mode}_{datetime.datetime.now():%Y%m%d_%H%M%S}"
+    if distributed and not args.run_id:
+        box = [run_id]
+        dist.broadcast_object_list(box, src=0)          # rank 0's id on every rank
+        run_id = box[0]
+    log_dir, ckpt_dir = REPO / "logs" / run_id, REPO / "checkpoints" / run_id
+    # this rank's own checkpoint folder (separate per rank, so it is also safe when two ranks
+    # share a disk, e.g. a local test); best.pt (rank 0) stays in ckpt_dir
+    rank_dir = ckpt_dir / f"rank{rank}"
     err = None
-    if is_main:
-        ld, cd = REPO / "logs" / run_id, REPO / "checkpoints" / run_id
-        if args.resume and not (cd / "last.pt").exists():
-            err = f"--resume: {cd / 'last.pt'} not found"
-        elif not args.resume and (ld.exists() or cd.exists()):
-            err = f"run '{run_id}' already exists; use a new --run-id or --resume"
+    if args.resume and not any((rank_dir / n).exists() for n in ("last.pt", "last.pt.prev")):
+        err = f"rank {rank}: --resume but no {rank_dir}/last.pt or last.pt.prev"
+    elif not args.resume and (log_dir.exists() or ckpt_dir.exists()):
+        err = f"rank {rank}: run '{run_id}' already exists; use a new --run-id or --resume"
     agree = {key: vars(args)[key] for key in ("mode", "backend", "global_batch", "epochs", "lr",
                                              "seed", "max_steps", "k_index", "head", "resume",
-                                             "run_id", "eval_batch", "cudnn_benchmark")}
+                                             "run_id", "eval_batch", "cudnn_benchmark",
+                                             "ckpt_every")}
     agree.update(local_batches=local_batches, world_size=world, torch=torch.__version__,
                  commit=git_info()["commit"])
-    checks = gather({"err": err, "agree": agree, "run_id": run_id}, distributed, world)
+    checks = gather({"err": err, "agree": agree}, distributed, world)
     errors = [c["err"] for c in checks if c["err"]]
     differ = {key: [c["agree"][key] for c in checks] for key in agree
               if any(c["agree"][key] != checks[0]["agree"][key] for c in checks)}
@@ -426,11 +496,9 @@ def main():
         errors.append(f"ranks disagree (values in rank order): {differ}")
     if errors:
         raise SystemExit("startup check failed: " + " | ".join(errors))
-    run_id = checks[0]["run_id"]                      # rank 0's id (matters if --run-id omitted)
-    log_dir, ckpt_dir = REPO / "logs" / run_id, REPO / "checkpoints" / run_id
-    if is_main:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    rank_dir.mkdir(parents=True, exist_ok=True)
+    steps_csv, epochs_csv = log_dir / f"steps_rank{rank}.csv", log_dir / f"epochs_rank{rank}.csv"
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -448,30 +516,51 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     grad_bytes = sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    derived = {"local_batches": local_batches, "world_size": world, "steps_per_epoch": steps_per_epoch}
 
-    # ---- resume (rank 0 reads last.pt and sends it to the other ranks)
-    start_epoch, best_val, best_epoch = 1, float("inf"), 0
+    # ---- resume: every rank reads its own last.pt (or last.pt.prev if last.pt is missing/bad).
+    # The ranks then agree on the newest position that ALL of them have, so a kill during a save
+    # on one node cannot make the ranks restart from different steps.
+    start_epoch, start_step, best_val, best_epoch = 1, 0, float("inf"), 0
+    progress = {"loss_sum": 0.0, "n": 0, "time": 0.0, "ckpt_s": 0.0}
     if args.resume:
-        ckpt = torch.load(ckpt_dir / "last.pt", map_location="cpu", weights_only=False) if is_main else None
-        if distributed:
-            box = [ckpt]
-            dist.broadcast_object_list(box, src=0)
-            ckpt = box[0]
+        cands = {}
+        for name in ("last.pt.prev", "last.pt"):        # last.pt wins a tie
+            c = load_ckpt(rank_dir / name)
+            if c is not None:
+                cands[ckpt_pos(c)] = (name, c)
+            elif (rank_dir / name).exists():
+                print(f"rank {rank}: {rank_dir / name} is unreadable or incomplete; ignoring it",
+                      flush=True)
+        offered = gather(sorted(cands), distributed, world)
+        common = set(offered[0]).intersection(*map(set, offered[1:]))
+        if not common:
+            raise SystemExit(f"--resume: no checkpoint position common to all ranks: {offered}")
+        pos = max(common)
+        name, ckpt = cands[pos]
         for key in RESUME_MUST_MATCH:
             want = local_batches if key == "local_batches" else getattr(args, key)
             have = ckpt["derived"]["local_batches"] if key == "local_batches" else ckpt["args"][key]
             if want != have:
                 raise SystemExit(f"--resume: {key}={want} but checkpoint has {have}")
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(ckpt["model"])            # this rank's own BatchNorm buffers
         optimizer.load_state_dict(ckpt["optimizer"])
         set_rng_state(ckpt["rng"])
-        start_epoch = ckpt["epoch"] + 1
         best_val, best_epoch = ckpt["best_val_loss"], ckpt["best_epoch"]
-        if is_main:
-            truncate_csv(log_dir / "steps.csv", ckpt["epoch"])
-            truncate_csv(log_dir / "epochs.csv", ckpt["epoch"])
-        log(f"resumed from {ckpt_dir / 'last.pt'}: last completed epoch {ckpt['epoch']}, "
-            f"continuing at epoch {start_epoch}")
+        ep, st, done = pos
+        if done or st >= steps_per_epoch:
+            start_epoch, start_step = ep + 1, 0
+        else:
+            start_epoch, start_step, progress = ep, st, dict(ckpt["progress"])
+        digests = gather(state_digest(model, optimizer), distributed, world)
+        if any(d != digests[0] for d in digests):
+            raise SystemExit("--resume: weights/optimizer differ between ranks after loading")
+        completed = ep if done else ep - 1
+        filter_csv(steps_csv, lambda r: (int(r[0]), int(r[1])) <= (ep, st))
+        filter_csv(epochs_csv, lambda r: int(r[0]) <= completed)
+        print(f"rank {rank}: resumed from {rank_dir / name} (epoch {ep}, step {st}"
+              f"{', epoch finished' if done else ''}) -> continuing at epoch {start_epoch}, "
+              f"step {start_step + 1}", flush=True)
 
     # ---- warm-up: build cuDNN/cuBLAS kernels on a throwaway copy (real weights, BN stats, RNG
     # untouched) so the first timed step does not include one-time CUDA initialisation
@@ -485,34 +574,42 @@ def main():
     del warm, wx, wy
     torch.cuda.synchronize()
 
-    # broadcast_buffers=False: no per-step BN-buffer broadcast. Rank 0's weights, running stats,
-    # checkpoints and val/test results are identical either way (rank 0 is the broadcast source,
-    # and train-mode BN uses batch statistics); it only removes one collective per step from t_fwd.
+    # broadcast_buffers=False: no per-step BN-buffer broadcast, and DDP's constructor does not
+    # overwrite the BatchNorm buffers either, so each rank keeps (and resumes) its own running
+    # stats. Parameters are broadcast from rank 0 at construction (identical anyway, see digest).
     net = DDP(model, device_ids=[0], broadcast_buffers=False) if distributed else model
 
-    # ---- config.json (all ranks)
+    # ---- config.json (every rank writes its own copy)
     ranks = gather(rank_info(rank), distributed, world)
     prints = gather(data_info["fingerprint"], distributed, world)
     if any(p != prints[0] for p in prints):
         raise SystemExit(f"data differs between ranks (sha256 per file): {prints}")
     notes = [
         "BatchNorm: local per-rank batch statistics (no SyncBatchNorm); DDP broadcast_buffers=False, "
-        "so each rank keeps its own running stats; rank 0's are used for val, test and checkpoints",
+        "so each rank keeps its own running stats (saved in its own checkpoint); rank 0's are used "
+        "for val, test and best.pt",
         f"fp32 only: no AMP, TF32 disabled for matmul and cuDNN; cudnn.benchmark={args.cudnn_benchmark}",
         "2-node loss: CE(sum over local samples) / G * world_size; DDP averages over world_size "
         "-> exact mean gradient of the global batch",
         f"head={args.head}: " + ("softmax output + CrossEntropyLoss, as in the notebook"
                                  if args.head == "softmax" else "logits + CrossEntropyLoss"),
-        "steps.csv: t_fwd = forward+loss, t_bwd = backward (incl. DDP all_reduce), t_opt = "
-        "optimizer.step, t_step = batch gather + fwd + bwd + opt (CUDA events); loss = local mean CE",
-        "epochs.csv: time_s = max over ranks of the training-loop wall time (no eval)",
+        "steps_rank<r>.csv: t_fwd = forward+loss, t_bwd = backward (incl. DDP all_reduce), t_opt = "
+        "optimizer.step, t_step = batch gather + fwd + bwd + opt (CUDA events); loss = local mean "
+        "CE; rows are written at every checkpoint and at the end of each epoch",
+        "epochs_rank<r>.csv: time_s = max over ranks of the training-loop time without checkpoint "
+        "saves and without downtime between a crash and --resume; ckpt_s = this rank's time spent "
+        "saving mid-epoch checkpoints; val metrics come from rank 0",
+        f"checkpoints: every rank saves checkpoints/<run_id>/rank<r>/last.pt every {args.ckpt_every} steps "
+        "and at the end of every epoch (tmp + fsync + rename + folder fsync; previous kept as "
+        "last.pt.prev); rank 0 also keeps best.pt",
+        f"process group timeout {PG_TIMEOUT_S} s: a rank that loses its peer exits",
         "--max-steps caps steps per epoch",
         "warm-up: 3 fwd/bwd + 1 eval forward on a deep copy of the model before training, with the "
         "same shapes as training (cuDNN autotune happens here, not in timed steps) "
         "(kernel init only; weights, BN stats and RNG unchanged)",
     ]
     config = {
-        "run_id": run_id, "args": vars(args), "argv": sys.argv, "world_size": world,
+        "run_id": run_id, "rank": rank, "args": vars(args), "argv": sys.argv, "world_size": world,
         "local_batches": local_batches, "steps_per_epoch": steps_per_epoch,
         "horizon_k": HORIZONS[k], "class_names": CLASS_NAMES,
         "param_count": n_params, "grad_bytes": grad_bytes, "grad_mb": grad_bytes / 1e6,
@@ -531,24 +628,33 @@ def main():
         "notes": notes,
         "started": datetime.datetime.now().isoformat(timespec="seconds"),
     }
-    if is_main:
-        name = "config.json" if not args.resume else f"config_resume_e{start_epoch}.json"
-        (log_dir / name).write_text(json.dumps(config, indent=2))
+    cfg_name = (f"config_rank{rank}.json" if not args.resume
+                else f"config_rank{rank}_resume_e{start_epoch}_s{start_step + 1}.json")
+    (log_dir / cfg_name).write_text(json.dumps(config, indent=2))
     log(f"run {run_id} | mode {args.mode} | world {world} | local batches {local_batches} | "
         f"G {G} | lr {args.lr} | k-index {k} (k={HORIZONS[k]}) | head {args.head}")
     log(f"hosts: {[(r['rank'], r['hostname'], r['gpu'], r['link']['speed']) for r in ranks]}")
     log(f"params {n_params:,} | gradient {grad_bytes / 1e6:.3f} MB ({grad_bytes / 2**20:.3f} MiB)")
     log(f"samples: train {len(train)} | val {len(val)} | test {len(test)} | "
-        f"steps/epoch {steps_per_epoch}")
+        f"steps/epoch {steps_per_epoch} | checkpoint every {args.ckpt_every} steps")
     log(notes[0])
 
     step_header = ["epoch", "step", "rank", "local_batch", "t_fwd_ms", "t_bwd_ms", "t_opt_ms",
                    "t_step_ms", "loss"]
     epoch_header = ["epoch", "time_s", "samples_per_s", "train_loss", "val_loss", "val_acc",
-                    "val_f1_macro"]
+                    "val_f1_macro", "ckpt_s"]
     scale = world / G  # 2-node loss scaling
 
+    def make_ckpt(epoch, step, done, prog):
+        return {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                "epoch": epoch, "step": step, "epoch_done": done, "progress": prog,
+                "best_val_loss": best_val, "best_epoch": best_epoch, "rng": rng_state(),
+                "args": vars(args), "derived": derived, "rank": rank, "run_id": run_id}
+
     for epoch in range(start_epoch, args.epochs + 1):
+        s0 = start_step if epoch == start_epoch else 0
+        prog = progress if epoch == start_epoch else {"loss_sum": 0.0, "n": 0, "time": 0.0,
+                                                      "ckpt_s": 0.0}
         net.train()
         g = torch.Generator()
         g.manual_seed(args.seed + epoch)
@@ -558,14 +664,29 @@ def main():
             if any(d != digests[0] for d in digests):
                 raise SystemExit(f"epoch {epoch}: train permutation differs between ranks")
         perm = perm_cpu.to(dev)
-        ev = [[torch.cuda.Event(enable_timing=True) for _ in range(5)] for _ in range(steps_per_epoch)]
-        step_loss = torch.zeros(steps_per_epoch, device=dev)
-        loss_sum = torch.zeros((), dtype=torch.float64, device=dev)
+        n_run = steps_per_epoch - s0
+        ev = [[torch.cuda.Event(enable_timing=True) for _ in range(5)] for _ in range(n_run)]
+        step_loss = torch.zeros(max(n_run, 1), device=dev)
+        loss_sum = torch.tensor(prog["loss_sum"], dtype=torch.float64, device=dev)
+        n_done, ckpt_s, flushed = prog["n"], 0.0, 0
+
+        def flush_rows(upto):
+            nonlocal flushed
+            losses = step_loss[flushed:upto].tolist()
+            rows = []
+            for j in range(flushed, upto):
+                e = ev[j]
+                rows.append([epoch, s0 + j + 1, rank, lb,
+                             round(e[1].elapsed_time(e[2]), 4), round(e[2].elapsed_time(e[3]), 4),
+                             round(e[3].elapsed_time(e[4]), 4), round(e[0].elapsed_time(e[4]), 4),
+                             round(losses[j - flushed], 6)])
+            append_csv(steps_csv, step_header, rows)
+            flushed = upto
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        for s in range(steps_per_epoch):
-            e = ev[s]
+        for j, s in enumerate(range(s0, steps_per_epoch)):
+            e = ev[j]
             e[0].record()
             idx = perm[s * G:(s + 1) * G][lo:hi]
             xb, yb = train.batch(idx, k)
@@ -579,58 +700,69 @@ def main():
             e[3].record()
             optimizer.step()
             e[4].record()
-            step_loss[s] = ce_sum.detach() / lb
+            step_loss[j] = ce_sum.detach() / lb
             loss_sum += ce_sum.detach().double()
+            n_done += lb
             if is_main and args.log_every and (s + 1) % args.log_every == 0:
-                print(f"  epoch {epoch} step {s + 1}/{steps_per_epoch} loss {step_loss[s].item():.4f}",
+                print(f"  epoch {epoch} step {s + 1}/{steps_per_epoch} loss {step_loss[j].item():.4f}",
                       flush=True)
+            if args.ckpt_every and (s + 1) % args.ckpt_every == 0 and s + 1 < steps_per_epoch:
+                torch.cuda.synchronize()
+                tc = time.perf_counter()
+                flush_rows(j + 1)
+                seg = tc - t0 - ckpt_s
+                save_durable(make_ckpt(epoch, s + 1, False,
+                                       {"loss_sum": loss_sum.item(), "n": n_done,
+                                        "time": prog["time"] + seg,
+                                        "ckpt_s": prog["ckpt_s"] + ckpt_s
+                                        + (time.perf_counter() - tc)}),
+                             rank_dir / "last.pt", keep_prev=True)
+                ckpt_s += time.perf_counter() - tc
         torch.cuda.synchronize()
-        train_time = time.perf_counter() - t0
+        train_time = prog["time"] + (time.perf_counter() - t0 - ckpt_s)
+        flush_rows(n_run)
 
-        losses = step_loss.tolist()
-        rows = []
-        for s in range(steps_per_epoch):
-            e = ev[s]
-            rows.append([epoch, s + 1, rank, lb,
-                         round(e[1].elapsed_time(e[2]), 4), round(e[2].elapsed_time(e[3]), 4),
-                         round(e[3].elapsed_time(e[4]), 4), round(e[0].elapsed_time(e[4]), 4),
-                         round(losses[s], 6)])
-        per_rank = gather({"rows": rows, "loss_sum": loss_sum.item(), "n": steps_per_epoch * lb,
-                           "time": train_time}, distributed, world)
-
+        per_rank = gather({"loss_sum": loss_sum.item(), "n": n_done, "time": train_time},
+                          distributed, world)
+        info = None
         if is_main:
-            append_csv(log_dir / "steps.csv", step_header,
-                       [r for pr in per_rank for r in pr["rows"]])
             time_s = max(pr["time"] for pr in per_rank)
             train_loss = sum(pr["loss_sum"] for pr in per_rank) / sum(pr["n"] for pr in per_rank)
             vm = evaluate(model, val, k, args.head, args.eval_batch)
-            append_csv(log_dir / "epochs.csv", epoch_header,
-                       [[epoch, round(time_s, 3), round(steps_per_epoch * G / time_s, 2),
-                         round(train_loss, 6), round(vm["loss"], 6), round(vm["acc"], 6),
-                         round(vm["f1_macro"], 6)]])
             if not math.isfinite(vm["loss"]):
                 print(f"WARNING: epoch {epoch} val loss is {vm['loss']}", flush=True)
             improved = vm["loss"] < best_val
             if improved:
                 best_val, best_epoch = vm["loss"], epoch
-            ckpt = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                    "epoch": epoch, "best_val_loss": best_val, "best_epoch": best_epoch,
-                    "rng": rng_state(), "args": vars(args),
-                    "derived": {"local_batches": local_batches, "world_size": world,
-                                "steps_per_epoch": steps_per_epoch}}
-            # best.pt first: last.pt must never claim a best epoch that is not on disk.
-            # (best.pt is also written if it does not exist yet, e.g. when val loss is NaN.)
             if improved or not (ckpt_dir / "best.pt").exists():
-                save_atomic(ckpt, ckpt_dir / "best.pt")
-            save_atomic(ckpt, ckpt_dir / "last.pt")
-            print(f"epoch {epoch}/{args.epochs} | {time_s:.1f} s | "
-                  f"{steps_per_epoch * G / time_s:.0f} samples/s | train_loss {train_loss:.4f} | "
-                  f"val_loss {vm['loss']:.4f} | val_acc {vm['acc']:.4f} | "
-                  f"val_f1 {vm['f1_macro']:.4f}{' | best' if improved else ''}", flush=True)
-        if distributed:
-            dist.barrier()
+                save_durable(make_ckpt(epoch, steps_per_epoch, True,
+                                       {"loss_sum": 0.0, "n": 0, "time": 0.0, "ckpt_s": 0.0}),
+                             ckpt_dir / "best.pt")
+            info = {"time_s": time_s, "train_loss": train_loss, "vm": vm, "improved": improved,
+                    "best_val": best_val, "best_epoch": best_epoch}
+        if distributed:                                  # val result + best-so-far to all ranks
+            box = [info]
+            dist.broadcast_object_list(box, src=0)
+            info = box[0]
+            best_val, best_epoch = info["best_val"], info["best_epoch"]
+        vm = info["vm"]
+        append_csv(epochs_csv, epoch_header,
+                   [[epoch, round(info["time_s"], 3), round(steps_per_epoch * G / info["time_s"], 2),
+                     round(info["train_loss"], 6), round(vm["loss"], 6), round(vm["acc"], 6),
+                     round(vm["f1_macro"], 6), round(prog["ckpt_s"] + ckpt_s, 3)]])
+        # best.pt (rank 0) is written before last.pt, so last.pt never names a best epoch
+        # that is not on disk
+        save_durable(make_ckpt(epoch, steps_per_epoch, True,
+                               {"loss_sum": 0.0, "n": 0, "time": 0.0, "ckpt_s": 0.0}),
+                     rank_dir / "last.pt", keep_prev=True)
+        log(f"epoch {epoch}/{args.epochs} | {info['time_s']:.1f} s | "
+            f"{steps_per_epoch * G / info['time_s']:.0f} samples/s | "
+            f"train_loss {info['train_loss']:.4f} | val_loss {vm['loss']:.4f} | "
+            f"val_acc {vm['acc']:.4f} | val_f1 {vm['f1_macro']:.4f}{' | best' if info['improved'] else ''}")
 
-    # ---- test (rank 0, best.pt)
+    # ---- test (rank 0 evaluates best.pt; every rank writes the result to its own logs/, so a
+    # job queue on any node can see that the run is finished)
+    result = None
     if is_main and not (ckpt_dir / "best.pt").exists():
         print(f"no {ckpt_dir / 'best.pt'} (no epoch was trained); skipping the test", flush=True)
     elif is_main:
@@ -644,10 +776,21 @@ def main():
                   "accuracy": tm["acc"], "f1_macro": tm["f1_macro"],
                   "f1_per_class": dict(zip(CLASS_NAMES, tm["f1_per_class"])),
                   "confusion_matrix": tm["confusion_matrix"], "test_loss": tm["loss"],
-                  "n_test": tm["n"]}
-        (log_dir / "test.json").write_text(json.dumps(result, indent=2))
+                  "n_test": tm["n"], "evaluated_on_rank": 0}
         print(f"test (best.pt, epoch {best['epoch']}): acc {tm['acc']:.4f} | "
               f"f1_macro {tm['f1_macro']:.4f} | n {tm['n']}", flush=True)
+    if distributed:
+        box = [result]
+        dist.broadcast_object_list(box, src=0)
+        result = box[0]
+    if result is not None:
+        tmp = log_dir / "test.json.tmp"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(result, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, log_dir / "test.json")
+        fsync_dir(log_dir)
     if distributed:
         dist.barrier()
         dist.destroy_process_group()
