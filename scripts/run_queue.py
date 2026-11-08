@@ -2,9 +2,11 @@
 """Run the training runs listed in configs/queue.txt, in order, and survive restarts.
 
 queue.txt: one run per line, "<run_id>: <train.py arguments>"; blank lines and # comments are
-ignored. Do not put --run-id or --resume in the arguments (this script adds them). Example:
+ignored. Do not put --run-id or --resume in the arguments (this script adds them).
+A single-GPU run (--mode single) must name the node that runs it: --node A or --node B (this
+option is read by run_queue.py and not passed to train.py). Example:
     g64_balanced_43_21: --mode balanced --local-batches 43,21 --epochs 5
-    g64_single:         --mode single --epochs 5
+    g64_single_A:       --mode single --node A --epochs 5
 
 For each run, on THIS node:
   logs/<run_id>/test.json exists              -> finished, skip it
@@ -13,13 +15,17 @@ For each run, on THIS node:
   neither                                     -> start it fresh; leftovers of an attempt that died
                                                  before its first checkpoint are moved aside
                                                  (logs/<run_id>.stale-<time>) first
---mode single runs only on node rank 0 (other nodes skip them). 2-node runs start torchrun with
-this node's --node-rank, so start run_queue.py on BOTH nodes with the same queue.txt.
+Single-GPU runs run only on the node named by their --node (give run_queue.py --node A or B);
+the other node skips them without waiting, and --node-rank does not matter for them.
+2-node runs start torchrun with this node's --node-rank, so start run_queue.py on BOTH nodes
+with the same queue.txt.
 The queue stops at the first run that fails (for example after the peer node died); start
 run_queue.py again on both nodes to resume from the checkpoints.
 
-Example (node A; node B uses --node-rank 1 and its own --ifname):
-  python scripts/run_queue.py --node-rank 0 --ifname eno1 --dry-run
+Examples:
+  node A, 2-node queue:  python scripts/run_queue.py --queue configs/queue_main.txt --node A --node-rank 0 --ifname eno1
+  node B, 2-node queue:  python scripts/run_queue.py --queue configs/queue_main.txt --node B --node-rank 1 --ifname <iface>
+  node A, single queue:  python scripts/run_queue.py --queue configs/queue_single_A.txt --node A
 """
 import argparse
 import datetime
@@ -31,6 +37,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 PY = sys.executable
+NODES = ("A", "B")
 
 
 def read_queue(path):
@@ -48,10 +55,22 @@ def read_queue(path):
             raise SystemExit(f"{path}:{n}: need a run_id and no --run-id/--resume in the arguments")
         if "--mode" not in argv:
             raise SystemExit(f"{path}:{n}: --mode is required")
+        mode = argv[argv.index("--mode") + 1]
+        node = None
+        if "--node" in argv:                       # run_queue option, not a train.py argument
+            i = argv.index("--node")
+            node = argv[i + 1] if i + 1 < len(argv) else ""
+            del argv[i:i + 2]
+            if node not in NODES:
+                raise SystemExit(f"{path}:{n}: --node must be one of {NODES}")
+        if mode == "single" and node is None:
+            raise SystemExit(f"{path}:{n}: a single-GPU run needs --node A or --node B")
+        if mode != "single" and node is not None:
+            raise SystemExit(f"{path}:{n}: --node is only for single-GPU runs")
         if run_id in seen:
             raise SystemExit(f"{path}:{n}: run_id '{run_id}' appears twice")
         seen.add(run_id)
-        runs.append((run_id, argv, argv[argv.index("--mode") + 1]))
+        runs.append((run_id, argv, mode, node))
     return runs
 
 
@@ -69,7 +88,9 @@ def state(run_id, rank):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--queue", default=str(REPO / "configs" / "queue.txt"))
-    ap.add_argument("--node-rank", type=int, default=0)
+    ap.add_argument("--node", choices=NODES, default=None,
+                    help="this node's name; needed if the queue has single-GPU runs")
+    ap.add_argument("--node-rank", type=int, default=0, help="torchrun node rank for 2-node runs")
     ap.add_argument("--nnodes", type=int, default=2)
     ap.add_argument("--master-addr", default="192.168.10.1")
     ap.add_argument("--master-port", type=int, default=29500)
@@ -80,15 +101,18 @@ def main():
     args = ap.parse_args()
 
     runs = read_queue(args.queue)
+    if any(m == "single" for _, _, m, _ in runs) and args.node is None:
+        raise SystemExit("this queue has single-GPU runs: give this node's name with --node A or B")
     env = dict(os.environ)
     if args.ifname:
         env.update(NCCL_SOCKET_IFNAME=args.ifname, GLOO_SOCKET_IFNAME=args.ifname, NCCL_IB_DISABLE="1")
-    print(f"queue {args.queue}: {len(runs)} runs | node rank {args.node_rank}", flush=True)
+    print(f"queue {args.queue}: {len(runs)} runs | node {args.node} | node rank {args.node_rank}",
+          flush=True)
 
-    for i, (run_id, argv, mode) in enumerate(runs, 1):
+    for i, (run_id, argv, mode, node) in enumerate(runs, 1):
         tag = f"[{i}/{len(runs)}] {run_id}"
-        if mode == "single" and args.node_rank != 0:
-            print(f"{tag}: single-GPU run, node rank 0 only -> skip on this node", flush=True)
+        if mode == "single" and node != args.node:
+            print(f"{tag}: single-GPU run for node {node} -> skip on node {args.node}", flush=True)
             continue
         st = state(run_id, 0 if mode == "single" else args.node_rank)
         if st == "done":
@@ -112,7 +136,8 @@ def main():
                 if d.exists():
                     d.rename(d.with_name(f"{d.name}.stale-{stamp}"))
                     print(f"{tag}: moved {d} aside", flush=True)
-        console = REPO / "logs" / f"queue_{run_id}_node{args.node_rank}.log"
+        console = REPO / "logs" / (f"queue_{run_id}_node{args.node}.log" if mode == "single"
+                                   else f"queue_{run_id}_node{args.node_rank}.log")
         console.parent.mkdir(parents=True, exist_ok=True)
         with open(console, "a") as log:
             log.write(f"\n===== {stamp} {st}: {shlex.join(cmd)}\n")

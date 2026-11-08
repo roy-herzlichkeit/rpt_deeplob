@@ -1,0 +1,6 @@
+# Phase 6: single-GPU reference runs on node A (RTX 4060). 30 epochs each.
+# Run on node A only:  python scripts/run_queue.py --queue configs/queue_single_A.txt --node A
+sA_g128_s1: --mode single --node A --global-batch 128 --epochs 30 --seed 1
+sA_g128_s2: --mode single --node A --global-batch 128 --epochs 30 --seed 2
+sA_g128_s3: --mode single --node A --global-batch 128 --epochs 30 --seed 3
+sA_g64_s1:  --mode single --node A --global-batch 64  --epochs 30 --seed 1

@@ -1,0 +1,5 @@
+# Phase 6: single-GPU reference runs on node B (RTX 3060). 30 epochs each.
+# Run on node B only:  python scripts/run_queue.py --queue configs/queue_single_B.txt --node B
+sB_g128_s1: --mode single --node B --global-batch 128 --epochs 30 --seed 1
+sB_g128_s2: --mode single --node B --global-batch 128 --epochs 30 --seed 2
+sB_g128_s3: --mode single --node B --global-batch 128 --epochs 30 --seed 3

@@ -1,0 +1,11 @@
+# Phase 6: main 2-node runs, 30 epochs each. Start on BOTH nodes:
+#   node A: python scripts/run_queue.py --queue configs/queue_main.txt --node A --node-rank 0 --ifname eno1
+#   node B: python scripts/run_queue.py --queue configs/queue_main.txt --node B --node-rank 1 --ifname <iface>
+m_eq128_s1:  --mode equal    --global-batch 128 --epochs 30 --seed 1
+m_bal128_s1: --mode balanced --global-batch 128 --local-batches 75,53   --epochs 30 --seed 1
+m_eq128_s2:  --mode equal    --global-batch 128 --epochs 30 --seed 2
+m_bal128_s2: --mode balanced --global-batch 128 --local-batches 75,53   --epochs 30 --seed 2
+m_eq128_s3:  --mode equal    --global-batch 128 --epochs 30 --seed 3
+m_bal128_s3: --mode balanced --global-batch 128 --local-batches 75,53   --epochs 30 --seed 3
+m_eq256_s1:  --mode equal    --global-batch 256 --epochs 30 --seed 1
+m_bal256_s1: --mode balanced --global-batch 256 --local-batches 136,120 --epochs 30 --seed 1
