@@ -1,0 +1,8 @@
+run,mode,G,split,median_ms,p95_ms,samples_per_s
+smoke_eq64,equal,64,"32,32",9.947,10.352,6417.8
+smoke_bal64,balanced,64,"43,21",10.229,10.933,6255.2
+smoke_eq128,equal,128,"64,64",14.31,14.887,8888.0
+smoke_bal128,balanced,128,"75,53",14.164,14.73,9006.7
+smoke_eq256,equal,256,"128,128",24.128,25.371,10569.9
+smoke_bal256,balanced,256,"136,120",24.054,24.645,10615.1
+ctl_bal64,balanced,64,"43,21",9.815,10.22,6510.0
