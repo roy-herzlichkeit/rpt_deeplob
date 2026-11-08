@@ -218,6 +218,8 @@ def parse_args():
                     help="label row 0..4 = horizon k=10,20,30,50,100 (default 3 = k50)")
     ap.add_argument("--head", choices=["softmax", "logits"], default="logits",
                     help="logits = plain CE (default); softmax = notebook (CE on softmax output)")
+    ap.add_argument("--cudnn-benchmark", choices=["on", "off"], default="on",
+                    help="cuDNN autotuning (on: autotune happens in the untimed warm-up)")
     ap.add_argument("--eval-batch", type=int, default=1024)
     ap.add_argument("--log-every", type=int, default=500)
     args = ap.parse_args()
@@ -389,7 +391,7 @@ def main():
 
     torch.cuda.set_device(0)
     dev = torch.device("cuda:0")
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark == "on"
     torch.backends.cudnn.allow_tf32 = False          # strict fp32 on both GPUs
     torch.backends.cuda.matmul.allow_tf32 = False
     if distributed:
@@ -413,7 +415,7 @@ def main():
             err = f"run '{run_id}' already exists; use a new --run-id or --resume"
     agree = {key: vars(args)[key] for key in ("mode", "backend", "global_batch", "epochs", "lr",
                                              "seed", "max_steps", "k_index", "head", "resume",
-                                             "run_id", "eval_batch")}
+                                             "run_id", "eval_batch", "cudnn_benchmark")}
     agree.update(local_batches=local_batches, world_size=world, torch=torch.__version__,
                  commit=git_info()["commit"])
     checks = gather({"err": err, "agree": agree, "run_id": run_id}, distributed, world)
@@ -496,7 +498,7 @@ def main():
     notes = [
         "BatchNorm: local per-rank batch statistics (no SyncBatchNorm); DDP broadcast_buffers=False, "
         "so each rank keeps its own running stats; rank 0's are used for val, test and checkpoints",
-        "fp32 only: no AMP, TF32 disabled for matmul and cuDNN, cudnn.benchmark=False",
+        f"fp32 only: no AMP, TF32 disabled for matmul and cuDNN; cudnn.benchmark={args.cudnn_benchmark}",
         "2-node loss: CE(sum over local samples) / G * world_size; DDP averages over world_size "
         "-> exact mean gradient of the global batch",
         f"head={args.head}: " + ("softmax output + CrossEntropyLoss, as in the notebook"
@@ -505,7 +507,8 @@ def main():
         "optimizer.step, t_step = batch gather + fwd + bwd + opt (CUDA events); loss = local mean CE",
         "epochs.csv: time_s = max over ranks of the training-loop wall time (no eval)",
         "--max-steps caps steps per epoch",
-        "warm-up: 3 fwd/bwd + 1 eval forward on a deep copy of the model before training "
+        "warm-up: 3 fwd/bwd + 1 eval forward on a deep copy of the model before training, with the "
+        "same shapes as training (cuDNN autotune happens here, not in timed steps) "
         "(kernel init only; weights, BN stats and RNG unchanged)",
     ]
     config = {

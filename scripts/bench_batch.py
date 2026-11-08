@@ -11,10 +11,12 @@ fwd_ms / bwd_ms / opt_ms = medians over the measured steps.
 samples_per_s = batch * steps / wall time of the synchronized measured block.
 peak_mem_mb = torch.cuda.max_memory_allocated over the measured steps (MB = 1e6 bytes);
   it includes the resident train data on the GPU (about 51 MB) and the model/Adam state.
+With --cudnn-benchmark on (default), cuDNN autotunes each new shape on its first call; that
+happens in the 20 warm-up steps of each batch size, so measured steps never include autotune time.
 A batch size that runs out of GPU memory gets "OOM" in its row and the sweep continues.
 Rows are written to the CSV as they finish.
 
-Run: python scripts/bench_batch.py        -> results/bench_<hostname>.csv
+Run: python scripts/bench_batch.py        -> results/bench_<hostname>_cudnn-<on|off>.csv
 """
 import argparse
 import csv
@@ -110,13 +112,15 @@ def main():
     ap.add_argument("--head", choices=["softmax", "logits"], default="logits")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--cudnn-benchmark", choices=["on", "off"], default="on",
+                    help="cuDNN autotuning; autotune runs in each batch size's warm-up steps")
     ap.add_argument("--node", default=socket.gethostname(), help="value of the 'node' column")
     ap.add_argument("--out", default=None, help="default: results/bench_<hostname>.csv")
     args = ap.parse_args()
 
     torch.cuda.set_device(0)
     dev = torch.device("cuda:0")
-    torch.backends.cudnn.benchmark = False             # same settings as train.py
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark == "on"   # same settings as train.py
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
 
@@ -125,11 +129,11 @@ def main():
     n_tr = int(x.shape[0] * (1 - tr.VAL_FRAC))
     train = tr.Split(torch.from_numpy(x).to(dev), torch.from_numpy(y).to(dev), tr.windows_in(0, n_tr))
 
-    out = Path(args.out) if args.out else tr.REPO / "results" / f"bench_{socket.gethostname()}.csv"
+    out = Path(args.out) if args.out else tr.REPO / "results" / f"bench_{socket.gethostname()}_cudnn-{args.cudnn_benchmark}.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
     print(f"node {args.node} | {socket.gethostname()} | {torch.cuda.get_device_name(0)} | "
           f"torch {torch.__version__} | warmup {args.warmup} | steps {args.steps} | "
-          f"k-index {args.k_index} | head {args.head}", flush=True)
+          f"k-index {args.k_index} | head {args.head} | cudnn.benchmark {args.cudnn_benchmark}", flush=True)
 
     if args.gpu_warmup_s > 0:                          # discarded: lets the GPU reach its clocks
         step = make_run(train, 64, args, dev)

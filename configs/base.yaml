@@ -1,5 +1,5 @@
 global_batch: 64
 epochs: 5
 seed: 42
-lr: 0.0001   # DeepLOB PyTorch notebook: torch.optim.Adam(model.parameters(), lr=0.0001)
+lr: 0.001   # node A learning check (3 epochs, k=50, logits): 1e-3 beat 1e-4 on val; notebook used 1e-4
 local_batches_balanced: "40,24"   # default --local-batches for --mode balanced (rank order)
