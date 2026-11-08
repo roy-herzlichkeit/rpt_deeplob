@@ -1,0 +1,15 @@
+# Phase 5b diagnostic queue (cudnn.benchmark on, seed 42 for every run).
+# nosync_*: TIMING ONLY (--no-sync: no gradient exchange, no checkpoints/validation/test).
+nosync_eq64:   --mode equal    --global-batch 64  --no-sync --epochs 1 --max-steps 300
+nosync_bal64:  --mode balanced --global-batch 64  --local-batches 43,21 --no-sync --epochs 1 --max-steps 300
+nosync_eq128:  --mode equal    --global-batch 128 --no-sync --epochs 1 --max-steps 300
+nosync_bal128: --mode balanced --global-batch 128 --local-batches 75,53 --no-sync --epochs 1 --max-steps 300
+# diag_*: full 1-epoch runs, same seed, alternating equal/balanced (a, then b repeat)
+diag_eq64_a:   --mode equal    --global-batch 64  --epochs 1 --seed 42
+diag_bal64_a:  --mode balanced --global-batch 64  --local-batches 43,21 --epochs 1 --seed 42
+diag_eq64_b:   --mode equal    --global-batch 64  --epochs 1 --seed 42
+diag_bal64_b:  --mode balanced --global-batch 64  --local-batches 43,21 --epochs 1 --seed 42
+diag_eq128_a:  --mode equal    --global-batch 128 --epochs 1 --seed 42
+diag_bal128_a: --mode balanced --global-batch 128 --local-batches 75,53 --epochs 1 --seed 42
+diag_eq128_b:  --mode equal    --global-batch 128 --epochs 1 --seed 42
+diag_bal128_b: --mode balanced --global-batch 128 --local-batches 75,53 --epochs 1 --seed 42

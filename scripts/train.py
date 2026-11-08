@@ -9,6 +9,7 @@ Data (FI-2010, NoAuction, DecPre): rows = 40 features + ... + 5 label rows, colu
 The whole dataset lives on the GPU; each batch is an index gather (no DataLoader).
 """
 import argparse
+import contextlib
 import copy
 import csv
 import datetime
@@ -223,6 +224,9 @@ def parse_args():
                     help="logits = plain CE (default); softmax = notebook (CE on softmax output)")
     ap.add_argument("--cudnn-benchmark", choices=["on", "off"], default="on",
                     help="cuDNN autotuning (on: autotune happens in the untimed warm-up)")
+    ap.add_argument("--no-sync", action="store_true",
+                    help="TIMING ONLY: run every step inside DDP no_sync(), i.e. no gradient exchange;\n"
+                         "ranks drift apart. No checkpoints, no validation, no test.")
     ap.add_argument("--ckpt-every", type=int, default=1000,
                     help="also save last.pt every N steps inside an epoch (0 = only at epoch end)")
     ap.add_argument("--eval-batch", type=int, default=1024)
@@ -478,14 +482,18 @@ def main():
     # share a disk, e.g. a local test); best.pt (rank 0) stays in ckpt_dir
     rank_dir = ckpt_dir / f"rank{rank}"
     err = None
-    if args.resume and not any((rank_dir / n).exists() for n in ("last.pt", "last.pt.prev")):
+    if args.no_sync and not distributed:
+        err = "--no-sync needs a 2-node mode (equal or balanced)"
+    elif args.no_sync and args.resume:
+        err = "--no-sync runs keep no checkpoints; start them again instead of --resume"
+    elif args.resume and not any((rank_dir / n).exists() for n in ("last.pt", "last.pt.prev")):
         err = f"rank {rank}: --resume but no {rank_dir}/last.pt or last.pt.prev"
     elif not args.resume and (log_dir.exists() or ckpt_dir.exists()):
         err = f"rank {rank}: run '{run_id}' already exists; use a new --run-id or --resume"
     agree = {key: vars(args)[key] for key in ("mode", "backend", "global_batch", "epochs", "lr",
                                              "seed", "max_steps", "k_index", "head", "resume",
                                              "run_id", "eval_batch", "cudnn_benchmark",
-                                             "ckpt_every")}
+                                             "ckpt_every", "no_sync")}
     agree.update(local_batches=local_batches, world_size=world, torch=torch.__version__,
                  commit=git_info()["commit"])
     checks = gather({"err": err, "agree": agree}, distributed, world)
@@ -644,6 +652,10 @@ def main():
     epoch_header = ["epoch", "time_s", "samples_per_s", "train_loss", "val_loss", "val_acc",
                     "val_f1_macro", "ckpt_s"]
     scale = world / G  # 2-node loss scaling
+    sync_ctx = net.no_sync if args.no_sync else contextlib.nullcontext
+    if args.no_sync:
+        log("NO-SYNC TIMING RUN: no gradient exchange (ranks drift apart); no checkpoints, "
+            "no validation, no test")
 
     def make_ckpt(epoch, step, done, prog):
         return {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
@@ -691,13 +703,14 @@ def main():
             idx = perm[s * G:(s + 1) * G][lo:hi]
             xb, yb = train.batch(idx, k)
             e[1].record()
-            out = net(xb)
-            ce_sum = F.cross_entropy(out, yb, reduction="sum")
-            loss = ce_sum * scale if distributed else ce_sum / lb
-            e[2].record()
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            e[3].record()
+            with sync_ctx():                              # no_sync(): no gradient exchange
+                out = net(xb)
+                ce_sum = F.cross_entropy(out, yb, reduction="sum")
+                loss = ce_sum * scale if distributed else ce_sum / lb
+                e[2].record()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                e[3].record()
             optimizer.step()
             e[4].record()
             step_loss[j] = ce_sum.detach() / lb
@@ -706,7 +719,8 @@ def main():
             if is_main and args.log_every and (s + 1) % args.log_every == 0:
                 print(f"  epoch {epoch} step {s + 1}/{steps_per_epoch} loss {step_loss[j].item():.4f}",
                       flush=True)
-            if args.ckpt_every and (s + 1) % args.ckpt_every == 0 and s + 1 < steps_per_epoch:
+            if (args.ckpt_every and not args.no_sync and (s + 1) % args.ckpt_every == 0
+                    and s + 1 < steps_per_epoch):
                 torch.cuda.synchronize()
                 tc = time.perf_counter()
                 flush_rows(j + 1)
@@ -728,6 +742,12 @@ def main():
         if is_main:
             time_s = max(pr["time"] for pr in per_rank)
             train_loss = sum(pr["loss_sum"] for pr in per_rank) / sum(pr["n"] for pr in per_rank)
+        if is_main and args.no_sync:
+            nan = float("nan")
+            info = {"time_s": time_s, "train_loss": train_loss, "improved": False,
+                    "best_val": best_val, "best_epoch": best_epoch,
+                    "vm": {"loss": nan, "acc": nan, "f1_macro": nan}}
+        elif is_main:
             vm = evaluate(model, val, k, args.head, args.eval_batch)
             if not math.isfinite(vm["loss"]):
                 print(f"WARNING: epoch {epoch} val loss is {vm['loss']}", flush=True)
@@ -752,9 +772,10 @@ def main():
                      round(vm["f1_macro"], 6), round(prog["ckpt_s"] + ckpt_s, 3)]])
         # best.pt (rank 0) is written before last.pt, so last.pt never names a best epoch
         # that is not on disk
-        save_durable(make_ckpt(epoch, steps_per_epoch, True,
-                               {"loss_sum": 0.0, "n": 0, "time": 0.0, "ckpt_s": 0.0}),
-                     rank_dir / "last.pt", keep_prev=True)
+        if not args.no_sync:
+            save_durable(make_ckpt(epoch, steps_per_epoch, True,
+                                   {"loss_sum": 0.0, "n": 0, "time": 0.0, "ckpt_s": 0.0}),
+                         rank_dir / "last.pt", keep_prev=True)
         log(f"epoch {epoch}/{args.epochs} | {info['time_s']:.1f} s | "
             f"{steps_per_epoch * G / info['time_s']:.0f} samples/s | "
             f"train_loss {info['train_loss']:.4f} | val_loss {vm['loss']:.4f} | "
@@ -763,7 +784,10 @@ def main():
     # ---- test (rank 0 evaluates best.pt; every rank writes the result to its own logs/, so a
     # job queue on any node can see that the run is finished)
     result = None
-    if is_main and not (ckpt_dir / "best.pt").exists():
+    if args.no_sync:                                      # timing-only run: completion marker
+        result = {"run_id": run_id, "no_sync": True,
+                  "note": "timing-only run (--no-sync): no gradient exchange, no validation, no test"}
+    elif is_main and not (ckpt_dir / "best.pt").exists():
         print(f"no {ckpt_dir / 'best.pt'} (no epoch was trained); skipping the test", flush=True)
     elif is_main:
         best = torch.load(ckpt_dir / "best.pt", map_location="cpu", weights_only=False)
@@ -784,7 +808,7 @@ def main():
         dist.broadcast_object_list(box, src=0)
         result = box[0]
     if result is not None:
-        tmp = log_dir / "test.json.tmp"
+        tmp = log_dir / f"test.json.tmp{rank}"            # per rank: safe on a shared disk
         with open(tmp, "w") as f:
             f.write(json.dumps(result, indent=2))
             f.flush()
