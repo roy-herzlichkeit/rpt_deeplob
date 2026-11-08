@@ -21,6 +21,9 @@ the other node skips them without waiting, and --node-rank does not matter for t
 with the same queue.txt.
 The queue stops at the first run that fails (for example after the peer node died); start
 run_queue.py again on both nodes to resume from the checkpoints.
+Link check (2-node runs): before each run, /sys/class/net/<--ifname>/speed must be --link-speed
+(default 1000 Mb/s) or the queue stops. After the run the speed is read again; if it changed,
+"link_changed" is written into logs/<run_id>/config_rank<node rank>.json.
 
 Examples:
   node A, 2-node queue:  python scripts/run_queue.py --queue configs/queue_main.txt --node A --node-rank 0 --ifname eno1
@@ -29,6 +32,7 @@ Examples:
 """
 import argparse
 import datetime
+import json
 import os
 import shlex
 import subprocess
@@ -74,6 +78,32 @@ def read_queue(path):
     return runs
 
 
+def link_speed(iface):
+    """Current link speed of iface in Mb/s, or None if it cannot be read (link down, no iface)."""
+    try:
+        return int(Path(f"/sys/class/net/{iface}/speed").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def mark_link_changed(run_id, node_rank, iface, before, after):
+    """Record a link speed change in this node's config file of the run."""
+    entry = {"iface": iface, "before_mbps": before, "after_mbps": after,
+             "checked": datetime.datetime.now().isoformat(timespec="seconds")}
+    log_dir = REPO / "logs" / run_id
+    cfgs = sorted(log_dir.glob(f"config_rank{node_rank}*.json")) if log_dir.exists() else []
+    if not cfgs:                       # run died before writing its config: separate file
+        log_dir.mkdir(parents=True, exist_ok=True)
+        cfgs = [log_dir / f"link_changed_rank{node_rank}.json"]
+    for path in cfgs:
+        data = json.loads(path.read_text()) if path.exists() else {}
+        data["link_changed"] = entry
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, path)
+    return cfgs
+
+
 def state(run_id, rank):
     log_dir, rank_dir = REPO / "logs" / run_id, REPO / "checkpoints" / run_id / f"rank{rank}"
     if (log_dir / "test.json").exists():
@@ -97,12 +127,17 @@ def main():
     ap.add_argument("--ifname", default=None,
                     help="Ethernet interface for NCCL/Gloo on this node (sets NCCL_SOCKET_IFNAME, "
                          "GLOO_SOCKET_IFNAME, NCCL_IB_DISABLE=1)")
+    ap.add_argument("--link-speed", type=int, default=1000,
+                    help="required link speed in Mb/s on --ifname before each 2-node run")
     ap.add_argument("--dry-run", action="store_true", help="only print what would run")
     args = ap.parse_args()
 
     runs = read_queue(args.queue)
     if any(m == "single" for _, _, m, _ in runs) and args.node is None:
         raise SystemExit("this queue has single-GPU runs: give this node's name with --node A or B")
+    if any(m != "single" for _, _, m, _ in runs) and not args.ifname:
+        raise SystemExit("this queue has 2-node runs: give the Ethernet interface with --ifname "
+                         "(used for NCCL/Gloo and for the link speed check)")
     env = dict(os.environ)
     if args.ifname:
         env.update(NCCL_SOCKET_IFNAME=args.ifname, GLOO_SOCKET_IFNAME=args.ifname, NCCL_IB_DISABLE="1")
@@ -129,6 +164,18 @@ def main():
                    f"--master_port={args.master_port}", *train]
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         print(f"{tag}: {st} -> {shlex.join(cmd)}", flush=True)
+        speed_before = None
+        if mode != "single":
+            speed_before = link_speed(args.ifname)
+            ok = speed_before == args.link_speed
+            print(f"{tag}: link {args.ifname} = {speed_before} Mb/s "
+                  f"({'OK' if ok else f'NOT {args.link_speed}'})", flush=True)
+            if not ok and not args.dry_run:
+                raise SystemExit(
+                    f"{tag}: STOP - link {args.ifname} is {speed_before} Mb/s, not "
+                    f"{args.link_speed} Mb/s. Fix the cable/link (check "
+                    f"/sys/class/net/{args.ifname}/speed on both nodes), then start run_queue.py "
+                    f"again on both nodes. The other node will stop when it cannot reach this one.")
         if args.dry_run:
             continue
         if st == "stale":                     # died before its first checkpoint: start over
@@ -146,8 +193,18 @@ def main():
                                  stderr=subprocess.STDOUT, text=True)
             for line in p.stdout:
                 sys.stdout.write(line)
+                sys.stdout.flush()
                 log.write(line)
+                log.flush()                   # keep the console log if the machine dies
             rc = p.wait()
+        if mode != "single":
+            speed_after = link_speed(args.ifname)
+            if speed_after != speed_before:
+                files = mark_link_changed(run_id, args.node_rank, args.ifname, speed_before,
+                                          speed_after)
+                print(f"{tag}: WARNING link_changed: {args.ifname} {speed_before} -> {speed_after} "
+                      f"Mb/s during the run; recorded in {', '.join(str(p) for p in files)}",
+                      flush=True)
         if rc != 0 or not (REPO / "logs" / run_id / "test.json").exists():
             raise SystemExit(f"{tag}: failed (exit code {rc}). The queue stops here; start "
                              f"run_queue.py again on all nodes to resume.")
