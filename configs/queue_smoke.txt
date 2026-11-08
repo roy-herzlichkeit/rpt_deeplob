@@ -1,0 +1,10 @@
+# Phase 5 smoke queue: 2-node step-time comparison, equal vs balanced split (cudnn.benchmark on).
+# Format: "<run_id>: <train.py arguments>"  (run_queue.py adds --run-id / --resume)
+smoke_eq64:   --mode equal    --global-batch 64  --epochs 1 --max-steps 300
+smoke_bal64:  --mode balanced --global-batch 64  --local-batches 43,21   --epochs 1 --max-steps 300
+smoke_eq128:  --mode equal    --global-batch 128 --epochs 1 --max-steps 300
+smoke_bal128: --mode balanced --global-batch 128 --local-batches 75,53   --epochs 1 --max-steps 300
+smoke_eq256:  --mode equal    --global-batch 256 --epochs 1 --max-steps 300
+smoke_bal256: --mode balanced --global-batch 256 --local-batches 136,120 --epochs 1 --max-steps 300
+# control: full run, 2 epochs, no kill (compare with kill_test_g64)
+ctl_bal64:    --mode balanced --global-batch 64  --local-batches 43,21   --epochs 2
