@@ -11,3 +11,6 @@ briefs/
 *.pth
 *.ckpt
 .env
+checkpoints/
+logs/*/
+logs/*.log
