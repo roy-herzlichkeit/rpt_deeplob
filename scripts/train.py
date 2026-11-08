@@ -147,11 +147,11 @@ def class_counts(split, k):
 class DeepLOB(nn.Module):
     """DeepLOB as in the authors' PyTorch notebook (run_train_pytorch.ipynb).
 
-    head='softmax' returns softmax probabilities (exactly like the notebook, which then applies
-    nn.CrossEntropyLoss on top). head='logits' returns raw logits.
+    head='logits' (default) returns raw logits for nn.CrossEntropyLoss. head='softmax' returns
+    softmax probabilities, exactly like the notebook (which then applies CrossEntropyLoss on top).
     """
 
-    def __init__(self, y_len=3, head="softmax"):
+    def __init__(self, y_len=3, head="logits"):
         super().__init__()
         self.head = head
         lrelu = lambda: nn.LeakyReLU(negative_slope=0.01)  # noqa: E731
@@ -214,10 +214,10 @@ def parse_args():
                     help="cap on optimizer steps per epoch (smoke tests)")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--resume", action="store_true", help="continue from checkpoints/<run_id>/last.pt")
-    ap.add_argument("--k-index", type=int, default=0, choices=range(5),
-                    help="label row 0..4 = horizon k=10,20,30,50,100")
-    ap.add_argument("--head", choices=["softmax", "logits"], default="softmax",
-                    help="softmax = notebook (CE applied on softmax output); logits = plain CE")
+    ap.add_argument("--k-index", type=int, default=3, choices=range(5),
+                    help="label row 0..4 = horizon k=10,20,30,50,100 (default 3 = k50)")
+    ap.add_argument("--head", choices=["softmax", "logits"], default="logits",
+                    help="logits = plain CE (default); softmax = notebook (CE on softmax output)")
     ap.add_argument("--eval-batch", type=int, default=1024)
     ap.add_argument("--log-every", type=int, default=500)
     args = ap.parse_args()
