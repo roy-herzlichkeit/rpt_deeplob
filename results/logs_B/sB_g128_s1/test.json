@@ -1,0 +1,40 @@
+{
+  "run_id": "sB_g128_s1",
+  "checkpoint": "/home/pritam/rpt_deeplob/checkpoints/sB_g128_s1/best.pt",
+  "best_epoch": 7,
+  "best_val_loss": 0.735586315321219,
+  "k_index": 3,
+  "horizon_k": 50,
+  "class_names": [
+    "up",
+    "stationary",
+    "down"
+  ],
+  "accuracy": 0.7867614329815493,
+  "f1_macro": 0.768482164738194,
+  "f1_per_class": {
+    "up": 0.7311092577147623,
+    "stationary": 0.8482386825197549,
+    "down": 0.7260985539800646
+  },
+  "confusion_matrix": [
+    [
+      26298,
+      6371,
+      5655
+    ],
+    [
+      3821,
+      57430,
+      4718
+    ],
+    [
+      3497,
+      5640,
+      25860
+    ]
+  ],
+  "test_loss": 0.5549251791528657,
+  "n_test": 139290,
+  "evaluated_on_rank": 0
+}

@@ -1,0 +1,40 @@
+{
+  "run_id": "m_eq128_s1",
+  "checkpoint": "/home/herzlichkeit/Desktop/Projects/rpt_deeplob/checkpoints/m_eq128_s1/best.pt",
+  "best_epoch": 6,
+  "best_val_loss": 0.7436482403440942,
+  "k_index": 3,
+  "horizon_k": 50,
+  "class_names": [
+    "up",
+    "stationary",
+    "down"
+  ],
+  "accuracy": 0.7850958432048245,
+  "f1_macro": 0.7654917765053063,
+  "f1_per_class": {
+    "up": 0.7301997362230954,
+    "stationary": 0.8473107613309798,
+    "down": 0.7189648319618437
+  },
+  "confusion_matrix": [
+    [
+      26852,
+      6706,
+      4766
+    ],
+    [
+      4137,
+      58084,
+      3748
+    ],
+    [
+      4234,
+      6343,
+      24420
+    ]
+  ],
+  "test_loss": 0.5625626048701811,
+  "n_test": 139290,
+  "evaluated_on_rank": 0
+}

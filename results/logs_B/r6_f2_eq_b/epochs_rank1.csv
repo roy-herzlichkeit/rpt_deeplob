@@ -1,0 +1,2 @@
+epoch,time_s,samples_per_s,train_loss,val_loss,val_acc,val_f1_macro,ckpt_s
+1,31.749,6414.34,0.930302,0.958467,0.490434,0.393484,0.07
