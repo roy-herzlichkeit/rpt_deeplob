@@ -15,6 +15,11 @@ For each run, on THIS node:
   neither                                     -> start it fresh; leftovers of an attempt that died
                                                  before its first checkpoint are moved aside
                                                  (logs/<run_id>.stale-<time>) first
+R6 slow-down: a queue line may carry "--slow A:<F>" (also B:<F>, repeatable). It is read by
+run_queue.py: only the named node passes --slow-factor <F> to train.py; the other node runs the
+same line unchanged. The queue file stays shared.
+This node's name is --node if given, otherwise it follows --node-rank (0 = A, 1 = B), so node B's
+usual command (--node-rank 1, no --node) needs no change.
 Single-GPU runs run only on the node named by their --node (give run_queue.py --node A or B);
 the other node skips them without waiting, and --node-rank does not matter for them.
 2-node runs start torchrun with this node's --node-rank, so start run_queue.py on BOTH nodes
@@ -60,6 +65,21 @@ def read_queue(path):
         if "--mode" not in argv:
             raise SystemExit(f"{path}:{n}: --mode is required")
         mode = argv[argv.index("--mode") + 1]
+        slow = {}
+        while "--slow" in argv:                    # run_queue option: per-node slow factor
+            i = argv.index("--slow")
+            val = argv[i + 1] if i + 1 < len(argv) else ""
+            del argv[i:i + 2]
+            who, _, fac = val.partition(":")
+            try:
+                fac = float(fac)
+            except ValueError:
+                fac = -1.0
+            if who not in NODES or fac < 1.0:
+                raise SystemExit(f"{path}:{n}: --slow needs <node>:<factor>, node A or B, factor >= 1")
+            slow[who] = fac
+        if any(a == "--slow-factor" or a.startswith("--slow-factor=") for a in argv):
+            raise SystemExit(f"{path}:{n}: use --slow A:<F> in the queue, not --slow-factor")
         node = None
         if "--node" in argv:                       # run_queue option, not a train.py argument
             i = argv.index("--node")
@@ -74,7 +94,7 @@ def read_queue(path):
         if run_id in seen:
             raise SystemExit(f"{path}:{n}: run_id '{run_id}' appears twice")
         seen.add(run_id)
-        runs.append((run_id, argv, mode, node))
+        runs.append((run_id, argv, mode, node, slow))
     return runs
 
 
@@ -133,9 +153,12 @@ def main():
     args = ap.parse_args()
 
     runs = read_queue(args.queue)
-    if any(m == "single" for _, _, m, _ in runs) and args.node is None:
+    if args.node is None and args.node_rank in (0, 1):  # 2-node default: rank 0 = A, rank 1 = B
+        if not any(m == "single" for _, _, m, _, _ in runs):
+            args.node = NODES[args.node_rank]
+    if any(m == "single" for _, _, m, _, _ in runs) and args.node is None:
         raise SystemExit("this queue has single-GPU runs: give this node's name with --node A or B")
-    if any(m != "single" for _, _, m, _ in runs) and not args.ifname:
+    if any(m != "single" for _, _, m, _, _ in runs) and not args.ifname:
         raise SystemExit("this queue has 2-node runs: give the Ethernet interface with --ifname "
                          "(used for NCCL/Gloo and for the link speed check)")
     env = dict(os.environ)
@@ -144,7 +167,7 @@ def main():
     print(f"queue {args.queue}: {len(runs)} runs | node {args.node} | node rank {args.node_rank}",
           flush=True)
 
-    for i, (run_id, argv, mode, node) in enumerate(runs, 1):
+    for i, (run_id, argv, mode, node, slow) in enumerate(runs, 1):
         tag = f"[{i}/{len(runs)}] {run_id}"
         if mode == "single" and node != args.node:
             print(f"{tag}: single-GPU run for node {node} -> skip on node {args.node}", flush=True)
@@ -156,6 +179,8 @@ def main():
         train = [str(REPO / "scripts" / "train.py"), "--run-id", run_id, *argv]
         if st == "resume":
             train.append("--resume")
+        if args.node in slow:                      # R6: only the named node is slowed
+            train += ["--slow-factor", f"{slow[args.node]:g}"]
         if mode == "single":
             cmd = [PY, *train]
         else:

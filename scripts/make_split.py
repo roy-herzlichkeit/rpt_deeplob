@@ -49,11 +49,14 @@ def main():
     ap.add_argument("--b", default=str(REPO / "results" / "bench_pritam_cudnn-on.csv"),
                     help="bench CSV of rank 1 (node B)")
     ap.add_argument("--global-batch", type=int, default=64)
+    ap.add_argument("--scale-a", type=float, default=1.0,
+                    help="multiply node A's step times by this factor (R6: A slowed by --slow-factor)")
     ap.add_argument("--out", default=None, help="optional JSON file for the result")
     args = ap.parse_args()
 
     G = args.global_batch
     a, b = load(args.a), load(args.b)
+    a = [(bs, t * args.scale_a) for bs, t in a]
     rows = []
     for ba in range(1, G):
         bb = G - ba
@@ -69,7 +72,8 @@ def main():
     best = min(rows, key=lambda r: (r["step_ms"], r["idle_ms"]))
     equal = next((r for r in rows if r["local_batches"] == [G // 2, G - G // 2]), None)
 
-    print(f"A: {args.a}\nB: {args.b}\nG = {G}   (t = step_ms_median, interpolated; * = both measured)")
+    print(f"A: {args.a}{f'  (x {args.scale_a:g})' if args.scale_a != 1 else ''}\nB: {args.b}\n"
+          f"G = {G}   (t = step_ms_median, interpolated; * = both measured)")
     print(f"{'A,B':>7} {'t_A ms':>8} {'t_B ms':>8} {'max ms':>8} {'idle ms':>8}")
     for r in rows:
         mark = " <- best" if r is best else (" <- equal" if r is equal else "")
@@ -86,6 +90,7 @@ def main():
               f"  node B: python scripts/bench_batch.py --node B --batches {best['local_batches'][1]} --out <file>")
     if args.out:
         Path(args.out).write_text(json.dumps({"global_batch": G, "a_csv": args.a, "b_csv": args.b,
+                                              "scale_a": args.scale_a,
                                               "best": best, "equal": equal}, indent=2))
         print(f"wrote {args.out}")
 

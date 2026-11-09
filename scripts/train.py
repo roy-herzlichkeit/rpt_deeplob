@@ -9,6 +9,7 @@ Data (FI-2010, NoAuction, DecPre): rows = 40 features + ... + 5 label rows, colu
 The whole dataset lives on the GPU; each batch is an index gather (no DataLoader).
 """
 import argparse
+import collections
 import contextlib
 import copy
 import csv
@@ -19,6 +20,7 @@ import math
 import os
 import random
 import socket
+import statistics
 import subprocess
 import sys
 import time
@@ -224,6 +226,11 @@ def parse_args():
                     help="logits = plain CE (default); softmax = notebook (CE on softmax output)")
     ap.add_argument("--cudnn-benchmark", choices=["on", "off"], default="on",
                     help="cuDNN autotuning (on: autotune happens in the untimed warm-up)")
+    ap.add_argument("--slow-factor", type=float, default=1.0,
+                    help="R6 test: make THIS rank F times slower in compute. After the forward pass\n"
+                         "and before the backward pass (so before the gradient exchange) it sleeps\n"
+                         "(F-1) x its running median compute time (forward+backward). Per rank:\n"
+                         "not required to match between ranks. Default 1.0 = off.")
     ap.add_argument("--no-sync", action="store_true",
                     help="TIMING ONLY: run every step inside DDP no_sync(), i.e. no gradient exchange;\n"
                          "ranks drift apart. No checkpoints, no validation, no test.")
@@ -482,7 +489,9 @@ def main():
     # share a disk, e.g. a local test); best.pt (rank 0) stays in ckpt_dir
     rank_dir = ckpt_dir / f"rank{rank}"
     err = None
-    if args.no_sync and not distributed:
+    if not args.slow_factor >= 1.0:
+        err = f"rank {rank}: --slow-factor must be >= 1.0 (got {args.slow_factor})"
+    elif args.no_sync and not distributed:
         err = "--no-sync needs a 2-node mode (equal or balanced)"
     elif args.no_sync and args.resume:
         err = "--no-sync runs keep no checkpoints; start them again instead of --resume"
@@ -577,6 +586,57 @@ def main():
     wx, wy = train.batch(torch.arange(lb, device=dev), k)
     for _ in range(3):
         F.cross_entropy(warm(wx), wy).backward()
+    slow = None
+    if args.slow_factor != 1.0:
+        # R6 calibration on the throwaway copy WITHOUT DDP (no gradient exchange included), at
+        # this rank's local batch, with a throwaway Adam so the step looks like a training step:
+        #  1) plain pipelined steps -> compute time C per step (what training does at F=1)
+        #  2) closed loop, 3 rounds: run the slow-down pattern (syncs around forward, sleep, then
+        #     backward + optimizer step) and adjust an offset until the step takes F x C
+        wopt = torch.optim.Adam(warm.parameters(), lr=0.0)
+        n_cal = 40
+
+        def cal_step(m, xb_, yb_, opt_, delay_s=None, fw=None):
+            if delay_s is not None:
+                torch.cuda.synchronize()
+                ta = time.perf_counter()
+            wl = F.cross_entropy(m(xb_), yb_)
+            if delay_s is not None:
+                torch.cuda.synchronize()
+                fw.append(time.perf_counter() - ta)
+                time.sleep(delay_s)
+            opt_.zero_grad(set_to_none=True)
+            wl.backward()
+            opt_.step()
+
+        for _ in range(5):
+            cal_step(warm, wx, wy, wopt)
+        torch.cuda.synchronize()
+        tp = time.perf_counter()
+        for _ in range(n_cal):
+            cal_step(warm, wx, wy, wopt)
+        torch.cuda.synchronize()
+        c_plain = (time.perf_counter() - tp) / n_cal
+        target, offset, fw = args.slow_factor * c_plain, 0.0, []
+        for _ in range(3):
+            delay = max(0.0, (args.slow_factor - 1) * c_plain - offset)
+            fw = []
+            torch.cuda.synchronize()
+            tp = time.perf_counter()
+            for _ in range(n_cal):
+                cal_step(warm, wx, wy, wopt, delay, fw)
+            torch.cuda.synchronize()
+            achieved = (time.perf_counter() - tp) / n_cal
+            offset = min(max(offset + achieved - target, 0.0), c_plain)   # keep it plausible
+        slow = {"factor": args.slow_factor, "calib_compute_ms": c_plain * 1e3,
+                "calib_fwd_ms": statistics.median(fw) * 1e3, "sync_overhead_ms": offset * 1e3,
+                "calib_achieved_ratio": achieved / c_plain}
+        slow_fwd = collections.deque(fw, maxlen=200)    # running window of synced forward times (s)
+        del wopt
+        if abs(slow["calib_achieved_ratio"] / args.slow_factor - 1) > 0.05:
+            print(f"rank {rank}: WARNING slow-factor calibration reached "
+                  f"{slow['calib_achieved_ratio']:.2f}x instead of {args.slow_factor:g}x (GPU busy "
+                  f"with another process during the warm-up?)", flush=True)
     with torch.no_grad():
         warm.eval()(val.batch(torch.arange(min(args.eval_batch, len(val)), device=dev), k)[0])
     del warm, wx, wy
@@ -612,12 +672,19 @@ def main():
         "last.pt.prev); rank 0 also keeps best.pt",
         f"process group timeout {PG_TIMEOUT_S} s: a rank that loses its peer exits",
         "--max-steps caps steps per epoch",
+        "R6 --slow-factor F (per rank): after forward, before backward/exchange, sleep "
+        "(F-1) x running compute time - sync overhead; compute = pipelined forward+backward time "
+        "calibrated without DDP in the warm-up, scaled by the running median (last 200 steps) of "
+        "the synchronized forward time (backward under DDP includes the gradient exchange, so it "
+        "is not measured directly); sync overhead = measured cost of the slow-down's own syncs; "
+        "t_slow_ms = sleep per step",
         "warm-up: 3 fwd/bwd + 1 eval forward on a deep copy of the model before training, with the "
         "same shapes as training (cuDNN autotune happens here, not in timed steps) "
         "(kernel init only; weights, BN stats and RNG unchanged)",
     ]
     config = {
         "run_id": run_id, "rank": rank, "args": vars(args), "argv": sys.argv, "world_size": world,
+        "slow_factor": args.slow_factor, "slow_calibration": slow,
         "local_batches": local_batches, "steps_per_epoch": steps_per_epoch,
         "horizon_k": HORIZONS[k], "class_names": CLASS_NAMES,
         "param_count": n_params, "grad_bytes": grad_bytes, "grad_mb": grad_bytes / 1e6,
@@ -646,9 +713,16 @@ def main():
     log(f"samples: train {len(train)} | val {len(val)} | test {len(test)} | "
         f"steps/epoch {steps_per_epoch} | checkpoint every {args.ckpt_every} steps")
     log(notes[0])
+    if slow:
+        print(f"rank {rank}: SLOW FACTOR {args.slow_factor:g} | calibrated at local batch {lb}: "
+              f"compute {slow['calib_compute_ms']:.2f} ms/step, fwd {slow['calib_fwd_ms']:.2f} ms, "
+              f"sync overhead {slow['sync_overhead_ms']:.2f} ms (calibrated ratio "
+              f"{slow['calib_achieved_ratio']:.2f}) -> initial delay "
+              f"{max(0.0, (args.slow_factor - 1) * slow['calib_compute_ms'] - slow['sync_overhead_ms']):.2f}"
+              f" ms/step", flush=True)
 
     step_header = ["epoch", "step", "rank", "local_batch", "t_fwd_ms", "t_bwd_ms", "t_opt_ms",
-                   "t_step_ms", "loss"]
+                   "t_step_ms", "loss", "t_slow_ms"]
     epoch_header = ["epoch", "time_s", "samples_per_s", "train_loss", "val_loss", "val_acc",
                     "val_f1_macro", "ckpt_s"]
     scale = world / G  # 2-node loss scaling
@@ -679,6 +753,7 @@ def main():
         n_run = steps_per_epoch - s0
         ev = [[torch.cuda.Event(enable_timing=True) for _ in range(5)] for _ in range(n_run)]
         step_loss = torch.zeros(max(n_run, 1), device=dev)
+        slow_ms = [0.0] * max(n_run, 1)
         loss_sum = torch.tensor(prog["loss_sum"], dtype=torch.float64, device=dev)
         n_done, ckpt_s, flushed = prog["n"], 0.0, 0
 
@@ -691,7 +766,7 @@ def main():
                 rows.append([epoch, s0 + j + 1, rank, lb,
                              round(e[1].elapsed_time(e[2]), 4), round(e[2].elapsed_time(e[3]), 4),
                              round(e[3].elapsed_time(e[4]), 4), round(e[0].elapsed_time(e[4]), 4),
-                             round(losses[j - flushed], 6)])
+                             round(losses[j - flushed], 6), round(slow_ms[j], 4)])
             append_csv(steps_csv, step_header, rows)
             flushed = upto
 
@@ -704,10 +779,21 @@ def main():
             xb, yb = train.batch(idx, k)
             e[1].record()
             with sync_ctx():                              # no_sync(): no gradient exchange
+                if slow:
+                    torch.cuda.synchronize()
+                    tf0 = time.perf_counter()
                 out = net(xb)
                 ce_sum = F.cross_entropy(out, yb, reduction="sum")
                 loss = ce_sum * scale if distributed else ce_sum / lb
                 e[2].record()
+                if slow:                                  # R6: extra compute time, before backward
+                    torch.cuda.synchronize()
+                    slow_fwd.append(time.perf_counter() - tf0)
+                    # compute now = calibrated compute x (running median forward / calibrated forward)
+                    comp_ms = slow["calib_compute_ms"] * statistics.median(slow_fwd) * 1e3 / slow["calib_fwd_ms"]
+                    delay_ms = max(0.0, (args.slow_factor - 1) * comp_ms - slow["sync_overhead_ms"])
+                    time.sleep(delay_ms / 1e3)
+                    slow_ms[j] = delay_ms
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 e[3].record()

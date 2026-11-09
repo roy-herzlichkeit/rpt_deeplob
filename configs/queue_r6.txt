@@ -1,0 +1,13 @@
+# R6: node A slowed on purpose (--slow A:<F> is applied by run_queue.py on node A only; node B
+# runs the same lines unchanged). G=128, 1 epoch each, 2 repeats (a, b), seed 1.
+# Balanced splits from make_split.py --global-batch 128 --scale-a F:  F=2 -> 54,74   F=3 -> 41,87
+#   node A: .venv/bin/python scripts/run_queue.py --queue configs/queue_r6.txt --node-rank 0 --ifname eno1
+#   node B: python scripts/run_queue.py --queue configs/queue_r6.txt --node-rank 1 --ifname <iface>
+r6_f2_eq_a:  --mode equal    --global-batch 128 --epochs 1 --seed 1 --slow A:2
+r6_f2_bal_a: --mode balanced --global-batch 128 --local-batches 54,74 --epochs 1 --seed 1 --slow A:2
+r6_f2_eq_b:  --mode equal    --global-batch 128 --epochs 1 --seed 1 --slow A:2
+r6_f2_bal_b: --mode balanced --global-batch 128 --local-batches 54,74 --epochs 1 --seed 1 --slow A:2
+r6_f3_eq_a:  --mode equal    --global-batch 128 --epochs 1 --seed 1 --slow A:3
+r6_f3_bal_a: --mode balanced --global-batch 128 --local-batches 41,87 --epochs 1 --seed 1 --slow A:3
+r6_f3_eq_b:  --mode equal    --global-batch 128 --epochs 1 --seed 1 --slow A:3
+r6_f3_bal_b: --mode balanced --global-batch 128 --local-batches 41,87 --epochs 1 --seed 1 --slow A:3
