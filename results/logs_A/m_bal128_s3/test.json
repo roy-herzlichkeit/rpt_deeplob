@@ -1,0 +1,40 @@
+{
+  "run_id": "m_bal128_s3",
+  "checkpoint": "/home/herzlichkeit/Desktop/Projects/rpt_deeplob/checkpoints/m_bal128_s3/best.pt",
+  "best_epoch": 11,
+  "best_val_loss": 0.7508656749307049,
+  "k_index": 3,
+  "horizon_k": 50,
+  "class_names": [
+    "up",
+    "stationary",
+    "down"
+  ],
+  "accuracy": 0.7819944001723024,
+  "f1_macro": 0.7647231719756769,
+  "f1_per_class": {
+    "up": 0.7361109259382708,
+    "stationary": 0.8424690840808265,
+    "down": 0.7155895059079335
+  },
+  "confusion_matrix": [
+    [
+      27606,
+      5846,
+      4872
+    ],
+    [
+      4638,
+      56306,
+      5025
+    ],
+    [
+      4437,
+      5548,
+      25012
+    ]
+  ],
+  "test_loss": 0.5727768978664166,
+  "n_test": 139290,
+  "evaluated_on_rank": 0
+}

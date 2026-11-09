@@ -1,0 +1,40 @@
+{
+  "run_id": "r6_f2_eq_b",
+  "checkpoint": "/home/herzlichkeit/Desktop/Projects/rpt_deeplob/checkpoints/r6_f2_eq_b/best.pt",
+  "best_epoch": 1,
+  "best_val_loss": 0.9584665593296499,
+  "k_index": 3,
+  "horizon_k": 50,
+  "class_names": [
+    "up",
+    "stationary",
+    "down"
+  ],
+  "accuracy": 0.5995548854907029,
+  "f1_macro": 0.4979162579982955,
+  "f1_per_class": {
+    "up": 0.18697400605281705,
+    "stationary": 0.7995285530697301,
+    "down": 0.5072462148723392
+  },
+  "confusion_matrix": [
+    [
+      4510,
+      9973,
+      23841
+    ],
+    [
+      1706,
+      56304,
+      7959
+    ],
+    [
+      3702,
+      8597,
+      22698
+    ]
+  ],
+  "test_loss": 0.816288448922281,
+  "n_test": 139290,
+  "evaluated_on_rank": 0
+}

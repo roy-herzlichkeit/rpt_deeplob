@@ -1,0 +1,105 @@
+{
+  "run_id": "m_bal128_s1",
+  "checkpoint": "checkpoints/m_bal128_s1/best.pt",
+  "best_epoch": 7,
+  "best_val_loss": 0.7218647051655233,
+  "k_index": 3,
+  "horizon_k": 50,
+  "head": "logits",
+  "n_test": 139290,
+  "test_files": [
+    "Test_Dst_NoAuction_DecPre_CF_7",
+    "Test_Dst_NoAuction_DecPre_CF_8",
+    "Test_Dst_NoAuction_DecPre_CF_9"
+  ],
+  "class_names": [
+    "up",
+    "stationary",
+    "down"
+  ],
+  "accuracy": 0.7909469452221983,
+  "per_class": {
+    "up": {
+      "precision": 0.7862042570730415,
+      "recall": 0.6968218348815364,
+      "f1": 0.7388194934362508,
+      "support": 38324,
+      "predicted": 33967
+    },
+    "stationary": {
+      "precision": 0.8213789780939156,
+      "recall": 0.8787157604329306,
+      "f1": 0.8490805094365877,
+      "support": 65969,
+      "predicted": 70574
+    },
+    "down": {
+      "precision": 0.7337765115542894,
+      "recall": 0.728576735148727,
+      "f1": 0.73116737877441,
+      "support": 34997,
+      "predicted": 34749
+    }
+  },
+  "macro_avg": {
+    "precision": 0.7804532489070821,
+    "recall": 0.7680381101543979,
+    "f1": 0.7730224605490829
+  },
+  "weighted_avg": {
+    "precision": 0.7896907052107849,
+    "recall": 0.7909469452221983,
+    "f1": 0.7891174897583542
+  },
+  "confusion_matrix": {
+    "rows": "true class",
+    "cols": "predicted class",
+    "labels": [
+      "up",
+      "stationary",
+      "down"
+    ],
+    "counts": [
+      [
+        26705,
+        6752,
+        4867
+      ],
+      [
+        3617,
+        57968,
+        4384
+      ],
+      [
+        3645,
+        5854,
+        25498
+      ]
+    ],
+    "row_normalised": [
+      [
+        0.696822,
+        0.176182,
+        0.126996
+      ],
+      [
+        0.054829,
+        0.878716,
+        0.066455
+      ],
+      [
+        0.104152,
+        0.167271,
+        0.728577
+      ]
+    ]
+  },
+  "check_against_test_json": {
+    "test_json_accuracy": 0.7909469452221983,
+    "test_json_f1_macro": 0.7730224605490829,
+    "same_confusion_matrix": true
+  },
+  "torch": "2.11.0+cu128",
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "created": "2026-11-09T13:01:29"
+}
